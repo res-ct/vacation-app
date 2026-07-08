@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'https://esm.sh/react@18.2.0';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'https://esm.sh/react@18.2.0';
 import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client';
 import { 
   Calendar, Users, Briefcase, CheckCircle, AlertTriangle, LogOut, ChevronLeft, ChevronRight, 
@@ -39,12 +39,29 @@ const INITIAL_USERS_DATA = [
 const INITIAL_VACATIONS_DATA = [];
 
 // --- HELPERS ---
-const isHoliday = (d) => RUSSIAN_HOLIDAYS.includes(`${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`);
+const HOLIDAY_SET = new Set(RUSSIAN_HOLIDAYS);
+const isHoliday = (d) => HOLIDAY_SET.has(`${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`);
 const isWeekend = (d) => d.getDay() === 0 || d.getDay() === 6 || isHoliday(d);
+
+// Кеш "строка даты -> timestamp локальной полуночи". Строки дат отпусков
+// повторяются в тысячах ячеек календаря, поэтому парсим каждую только один раз.
+const _tsCache = new Map();
+const dayTS = (dateStr) => {
+  let t = _tsCache.get(dateStr);
+  if (t === undefined) { const d = new Date(dateStr); d.setHours(0, 0, 0, 0); t = d.getTime(); _tsCache.set(dateStr, t); }
+  return t;
+};
+
+// Кеш количества дней по паре (start,end): одни и те же диапазоны считаются много раз.
+const _billCache = new Map();
 const countBillableDays = (s, e) => {
   if (!s || !e) return 0;
+  const key = s + '|' + e;
+  const hit = _billCache.get(key);
+  if (hit !== undefined) return hit;
   let c = 0, cur = new Date(s), end = new Date(e);
   while (cur <= end) { if (!isHoliday(cur)) c++; cur.setDate(cur.getDate() + 1); }
+  _billCache.set(key, c);
   return c;
 };
 const checkOverlap = (s1, e1, s2, e2) => s1 <= e2 && s2 <= e1;
@@ -53,7 +70,7 @@ const isSameDay = (d1, d2) => d1.getDate() === d2.getDate() && d1.getMonth() ===
 
 // --- COMPONENTS ---
 
-const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, confirmText = "Удалить", isDanger = true }) => {
+const ConfirmModal = React.memo(({ isOpen, title, message, onConfirm, onCancel, confirmText = "Удалить", isDanger = true }) => {
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
@@ -70,9 +87,9 @@ const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, confirmText
       </div>
     </div>
   );
-};
+});
 
-const Header = ({ user, onLogout }) => {
+const Header = React.memo(({ user, onLogout }) => {
   if (!user) return null;
   let roleIcon = <Calendar className="text-white w-6 h-6" />;
   let headerBg = 'bg-blue-600';
@@ -106,13 +123,22 @@ const Header = ({ user, onLogout }) => {
       </div>
     </div>
   );
-};
+});
 
-const BalanceCard = ({ user, vacations }) => {
+const BalanceCard = React.memo(({ user, vacations }) => {
     const totalAllowance = Number(user.yearlyAllowance) + Number(user.carryOverDays);
-    const usedDays = vacations.filter(v => v.userId === user.id && v.status === 'approved').reduce((acc, v) => acc + countBillableDays(v.startDate, v.endDate), 0);
-    const pendingDays = vacations.filter(v => v.userId === user.id && v.status === 'pending').reduce((acc, v) => acc + countBillableDays(v.startDate, v.endDate), 0);
-    const draftDays = vacations.filter(v => v.userId === user.id && v.status === 'draft').reduce((acc, v) => acc + countBillableDays(v.startDate, v.endDate), 0);
+    // Один проход вместо трёх filter().reduce()
+    const { usedDays, pendingDays, draftDays } = useMemo(() => {
+        let used = 0, pending = 0, draft = 0;
+        for (const v of vacations) {
+            if (v.userId !== user.id) continue;
+            const d = countBillableDays(v.startDate, v.endDate);
+            if (v.status === 'approved') used += d;
+            else if (v.status === 'pending') pending += d;
+            else if (v.status === 'draft') draft += d;
+        }
+        return { usedDays: used, pendingDays: pending, draftDays: draft };
+    }, [vacations, user.id]);
     const remainingDays = totalAllowance - usedDays;
 
     return (
@@ -129,25 +155,49 @@ const BalanceCard = ({ user, vacations }) => {
             {draftDays > 0 && <div className="mb-4 bg-gray-50 border border-gray-200 rounded-lg p-2 flex items-center justify-center gap-2 text-xs text-gray-600"><FileText className="w-3 h-3" /> В черновиках: <b>{draftDays}</b> дн.</div>}
         </div>
     );
-};
+});
 
-const PersonalYearCalendar = ({ year, user, vacations, users, onSelectRange, selection, balance, onPrevYear, onNextYear }) => {
+const PersonalYearCalendar = React.memo(({ year, user, vacations, users, onSelectRange, selection, balance, onPrevYear, onNextYear }) => {
     const [tooltip, setTooltip] = useState(null);
+
+    // --- Предрасчёт диапазонов отпусков как timestamp'ов (один раз на изменение данных) ---
+    const myRanges = useMemo(() => vacations
+        .filter(v => v.userId === user.id && v.status !== 'rejected')
+        .map(v => ({ s: dayTS(v.startDate), e: dayTS(v.endDate), status: v.status })),
+        [vacations, user.id]);
+
+    const teamIdSet = useMemo(() => new Set(
+        users.filter(u => u.department === user.department && u.id !== user.id).map(u => u.id)
+    ), [users, user.department, user.id]);
+
+    const teamRanges = useMemo(() => vacations
+        .filter(v => teamIdSet.has(v.userId) && v.status !== 'rejected')
+        .map(v => ({ s: dayTS(v.startDate), e: dayTS(v.endDate), status: v.status, userId: v.userId })),
+        [vacations, teamIdSet]);
+
+    const nameById = useMemo(() => {
+        const m = new Map();
+        users.forEach(u => m.set(u.id, u.name));
+        return m;
+    }, [users]);
+
+    // Timestamp сегодняшней локальной полуночи — для подсветки текущего дня
+    const todayTs = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }, []);
 
     const renderMonth = (monthIndex) => {
         const date = new Date(year, monthIndex, 1);
         const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
         const startDay = (date.getDay() + 6) % 7; 
         const days = [];
-        
-        const teamIds = users.filter(u => u.department === user.department && u.id !== user.id).map(u => u.id);
 
         for (let i = 0; i < startDay; i++) days.push(<div key={`e-${i}`} className="w-8 h-8"></div>);
         for (let d = 1; d <= daysInMonth; d++) {
             const current = new Date(year, monthIndex, d);
+            const dayTs = current.getTime();
+            const isToday = dayTs === todayTs;
             const isWe = isWeekend(current);
-            const vac = vacations.find(v => v.userId === user.id && current >= new Date(v.startDate).setHours(0,0,0,0) && current <= new Date(v.endDate).setHours(0,0,0,0) && v.status !== 'rejected');
-            const teamVacs = vacations.filter(v => teamIds.includes(v.userId) && current >= new Date(v.startDate).setHours(0,0,0,0) && current <= new Date(v.endDate).setHours(0,0,0,0) && v.status !== 'rejected');
+            const vac = myRanges.find(r => dayTs >= r.s && dayTs <= r.e);
+            const teamVacs = teamRanges.filter(r => dayTs >= r.s && dayTs <= r.e);
             
             let bgClass = isWe ? "text-red-500" : "text-gray-700";
             let cellClass = "hover:bg-gray-100 cursor-pointer relative";
@@ -177,8 +227,8 @@ const PersonalYearCalendar = ({ year, user, vacations, users, onSelectRange, sel
                 if (teamVacs.length > 0) {
                     if (vac) lines.push('---');
                     teamVacs.forEach(v => {
-                        const u = users.find(u => u.id === v.userId);
-                        if (u) lines.push(`${u.name}: ${v.status === 'approved' ? 'Согласовано' : v.status === 'pending' ? 'Ждет' : 'Черновик'}`);
+                        const name = nameById.get(v.userId);
+                        if (name) lines.push(`${name}: ${v.status === 'approved' ? 'Согласовано' : v.status === 'pending' ? 'Ждет' : 'Черновик'}`);
                     });
                 }
                 return lines.length > 0 ? lines.join('\n') : null;
@@ -197,7 +247,7 @@ const PersonalYearCalendar = ({ year, user, vacations, users, onSelectRange, sel
                         }
                     }}
                     onMouseLeave={() => setTooltip(null)}
-                    className={`w-8 h-8 flex items-center justify-center text-sm rounded-full transition-colors ${bgClass} ${cellClass}`}
+                    className={`w-8 h-8 flex items-center justify-center text-sm rounded-full transition-colors ${bgClass} ${cellClass} ${isToday ? 'ring-2 ring-offset-1 ring-blue-600 font-bold' : ''}`}
                 >
                     {d}
                     {indicator}
@@ -211,6 +261,12 @@ const PersonalYearCalendar = ({ year, user, vacations, users, onSelectRange, sel
             </div>
         );
     };
+
+    // Сетка не зависит от tooltip -> при наведении мыши месяцы не перестраиваются.
+    const monthsGrid = useMemo(
+        () => Array.from({ length: 12 }, (_, i) => renderMonth(i)),
+        [year, myRanges, teamRanges, selection, onSelectRange, nameById, todayTs]
+    );
 
     return (
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 relative">
@@ -232,7 +288,7 @@ const PersonalYearCalendar = ({ year, user, vacations, users, onSelectRange, sel
                     <div className="text-sm text-gray-500 mr-4">Доступно: <span className="font-bold text-blue-600">{balance}</span> дн. {selection.count > 0 && <span className="ml-2 text-indigo-600">(Выбрано: {selection.count})</span>}</div>
                 </div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">{Array.from({length: 12}, (_, i) => renderMonth(i))}</div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">{monthsGrid}</div>
             
             <div className="mt-6 pt-4 border-t border-gray-100 flex flex-wrap gap-4 text-xs text-gray-600">
                 <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-blue-600"></div>Ваш (Одобрен)</div>
@@ -242,12 +298,13 @@ const PersonalYearCalendar = ({ year, user, vacations, users, onSelectRange, sel
                 <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-orange-100 border border-orange-200"></div>Коллега (Ждет)</div>
                 <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full border border-dashed border-gray-400 bg-gray-50"></div>Коллега (Черновик)</div>
                 <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-red-500"></div>Пересечение</div>
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full ring-2 ring-blue-600 ring-offset-1"></div>Сегодня</div>
             </div>
         </div>
     );
-};
+});
 
-const TeamCalendar = ({ vacations, users, departments, currentMonthDate, onPrev, onNext, viewMode, setViewMode, currentUser, localDraft }) => {
+const TeamCalendar = React.memo(({ vacations, users, departments, currentMonthDate, onPrev, onNext, viewMode, setViewMode, currentUser, localDraft }) => {
     const year = currentMonthDate.getFullYear();
     const month = currentMonthDate.getMonth();
     const today = new Date();
@@ -270,14 +327,29 @@ const TeamCalendar = ({ vacations, users, departments, currentMonthDate, onPrev,
         else setExpandedDepts([...expandedDepts, dept]);
     };
 
+    // Индекс: userId -> массив диапазонов {s, e, status}. Строится один раз на изменение отпусков.
+    const rangesByUser = useMemo(() => {
+        const m = new Map();
+        for (const v of vacations) {
+            let arr = m.get(v.userId);
+            if (!arr) { arr = []; m.set(v.userId, arr); }
+            arr.push({ s: dayTS(v.startDate), e: dayTS(v.endDate), status: v.status });
+        }
+        return m;
+    }, [vacations]);
+
     const getVacationForDay = (uid, d) => {
-        return vacations.find(v => v.userId === uid && d >= new Date(v.startDate).setHours(0,0,0,0) && d <= new Date(v.endDate).setHours(0,0,0,0));
+        const arr = rangesByUser.get(uid);
+        if (!arr) return null;
+        return arr.find(r => d >= r.s && d <= r.e) || null;
     };
 
-    const isLocalDraftDay = (d) => {
-        if (!localDraft || !localDraft.start || !localDraft.end) return false;
-        return d >= new Date(localDraft.start).setHours(0,0,0,0) && d <= new Date(localDraft.end).setHours(0,0,0,0);
-    };
+    const localDraftRange = useMemo(() => {
+        if (!localDraft || !localDraft.start || !localDraft.end) return null;
+        return { s: dayTS(localDraft.start), e: dayTS(localDraft.end) };
+    }, [localDraft]);
+
+    const isLocalDraftDay = (d) => localDraftRange !== null && d >= localDraftRange.s && d <= localDraftRange.e;
 
     const usersByDept = useMemo(() => {
         const grouped = {};
@@ -361,9 +433,11 @@ const TeamCalendar = ({ vacations, users, departments, currentMonthDate, onPrev,
                                             return v && v.status === 'approved' ? <div key={d} className="absolute inset-y-1 bg-blue-500 rounded-sm opacity-90" style={{left:`${(d/days)*100}%`, width: `${100/days}%`}}/> : null;
                                         })}</div> :
                                         Array.from({length:days},(_,i)=>i+1).map(d => {
-                                            const dt = new Date(year, mIdx, d).getTime();
+                                            const cellDate = new Date(year, mIdx, d);
+                                            const dt = cellDate.getTime();
                                             const v = getVacationForDay(u.id, dt);
-                                            const isWe = isWeekend(new Date(year, mIdx, d));
+                                            const isWe = isWeekend(cellDate);
+                                            const isToday = isSameDay(cellDate, today);
                                             const isLocal = u.id === currentUser.id && isLocalDraftDay(dt);
                                             
                                             let content = null;
@@ -376,7 +450,7 @@ const TeamCalendar = ({ vacations, users, departments, currentMonthDate, onPrev,
                                                 else if (v.status === 'draft') content = <div className="absolute inset-1 border-2 border-dashed border-gray-300 rounded-sm bg-gray-50" title="Черновик"></div>;
                                             }
                                             
-                                            return <div key={d} className={`w-8 flex-shrink-0 border-r border-gray-100 relative min-w-[28px] ${isWe ? 'bg-gray-50' : 'bg-white'}`}>
+                                            return <div key={d} className={`w-8 flex-shrink-0 border-r border-gray-100 relative min-w-[28px] ${isToday ? 'bg-blue-50 ring-1 ring-inset ring-blue-300 z-[1]' : isWe ? 'bg-gray-50' : 'bg-white'}`}>
                                                 {content}
                                             </div>
                                         })
@@ -389,27 +463,41 @@ const TeamCalendar = ({ vacations, users, departments, currentMonthDate, onPrev,
             </div>
         </div>
     );
-};
+});
 
 const UserView = ({ user, users, vacs, onAdd, onUpdate, onDel, calendarProps }) => {
     const [sel, setSel] = useState({ start: null, end: null, count: 0 });
     const [replacementId, setReplacementId] = useState('');
     const [isSendingDrafts, setIsSendingDrafts] = useState(false);
-    const draftCount = vacs.filter(v => v.userId === user.id && v.status === 'draft').length;
-    
+    // Отпуска текущего пользователя считаем один раз
+    const myVacs = useMemo(() => vacs.filter(v => v.userId === user.id), [vacs, user.id]);
+    const draftCount = useMemo(() => myVacs.filter(v => v.status === 'draft').length, [myVacs]);
+
     // Calculate Balance
     const totalAllowance = Number(user.yearlyAllowance) + Number(user.carryOverDays);
-    const usedDays = vacs.filter(v => v.userId === user.id && v.status !== 'rejected' && v.status !== 'draft').reduce((acc, v) => acc + countBillableDays(v.startDate, v.endDate), 0);
+    const usedDays = useMemo(
+        () => myVacs.filter(v => v.status !== 'rejected' && v.status !== 'draft')
+                    .reduce((acc, v) => acc + countBillableDays(v.startDate, v.endDate), 0),
+        [myVacs]
+    );
     const remainingDays = totalAllowance - usedDays;
+
+    // Список отделов для TeamCalendar — стабильная ссылка, чтобы не ломать мемоизацию
+    const deptList = useMemo(() => [...new Set(users.map(u => u.department))], [users]);
 
     const potentialReplacements = useMemo(() => {
         return users.filter(u => u.department === user.department && u.id !== user.id);
     }, [users, user]);
 
-    const handleSelect = (date) => {
-        if (!sel.start || (sel.start && sel.end)) { setSel({ start: date, end: null, count: 0 }); } 
-        else { let s = sel.start, e = date; if (date < s) { s = date; e = sel.start; } const days = countBillableDays(s, e); setSel({ start: s, end: e, count: days }); }
-    };
+    // Функциональный setSel убирает зависимость от sel -> ссылка стабильна между рендерами
+    const handleSelect = useCallback((date) => {
+        setSel(prev => {
+            if (!prev.start || (prev.start && prev.end)) return { start: date, end: null, count: 0 };
+            let s = prev.start, e = date;
+            if (date < s) { s = date; e = prev.start; }
+            return { start: s, end: e, count: countBillableDays(s, e) };
+        });
+    }, []);
     
     const handleAction = (status) => {
         if (!sel.start || !sel.end) return;
@@ -507,8 +595,8 @@ const UserView = ({ user, users, vacs, onAdd, onUpdate, onDel, calendarProps }) 
                         {draftCount > 0 && (<button onClick={sendAllDrafts} className="flex items-center gap-1 bg-blue-50 text-blue-700 px-3 py-1 rounded text-xs hover:bg-blue-100 font-medium transition-colors"><Send className="w-3 h-3"/> Отправить все</button>)}
                     </div>
                     <div className="space-y-2">
-                        {vacs.filter(v=>v.userId===user.id).length === 0 && <p className="text-sm text-gray-400 italic">Пока нет запланированных отпусков</p>}
-                        {vacs.filter(v=>v.userId===user.id).sort((a,b)=>new Date(a.startDate)-new Date(b.startDate)).map(v=>(
+                        {myVacs.length === 0 && <p className="text-sm text-gray-400 italic">Пока нет запланированных отпусков</p>}
+                        {[...myVacs].sort((a,b)=>new Date(a.startDate)-new Date(b.startDate)).map(v=>(
                             <div key={v.id} className="flex justify-between items-start text-sm border-b border-gray-100 pb-3 last:border-0 hover:bg-gray-50 p-2 rounded-lg transition-colors">
                                 <div>
                                     <div className="font-medium text-gray-800">{new Date(v.startDate).toLocaleDateString()} — {new Date(v.endDate).toLocaleDateString()}</div>
@@ -544,7 +632,7 @@ const UserView = ({ user, users, vacs, onAdd, onUpdate, onDel, calendarProps }) 
                  
                  <div className="mt-8">
                     <h2 className="text-xl font-bold text-gray-800 mb-6 flex items-center gap-2"><Users className="w-6 h-6"/> График отдела</h2>
-                    <TeamCalendar vacations={vacs} users={users} departments={[...new Set(users.map(u=>u.department))]} currentUser={user} {...calendarProps} />
+                    <TeamCalendar vacations={vacs} users={users} departments={deptList} currentUser={user} {...calendarProps} />
                  </div>
             </div>
             <ConfirmModal isOpen={isSendingDrafts} title="Отправка черновиков" message={`Отправить все черновики (${draftCount}) на согласование?`} confirmText="Отправить" isDanger={false} onConfirm={confirmSend} onCancel={() => setIsSendingDrafts(false)} />
@@ -592,7 +680,7 @@ const ManagerAnalyticsPage = ({ department, users, vacations, onBack }) => {
     );
 };
 
-const AdminStats = ({ users, vacations }) => {
+const AdminStats = React.memo(({ users, vacations }) => {
     const totalUsers = users.filter(u => u.role !== 'admin').length;
     const totalVacationDays = vacations.filter(v => v.status === 'approved').reduce((acc, v) => acc + countBillableDays(v.startDate, v.endDate), 0);
     return (
@@ -601,7 +689,7 @@ const AdminStats = ({ users, vacations }) => {
             <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex justify-between items-center"><div><div className="text-gray-500 text-sm">Дней отпуска (Согл.)</div><div className="text-3xl font-bold">{totalVacationDays}</div></div><Calendar className="w-8 h-8 text-green-500 opacity-20"/></div>
         </div>
     );
-};
+});
 
 const DepartmentManagement = ({ departments, setDepartments, users, setUsers, deptDocs }) => {
     const [newDept, setNewDept] = useState('');
@@ -994,5 +1082,3 @@ const App = () => {
 const container = document.getElementById('root');
 const root = createRoot(container);
 root.render(React.createElement(App));
-
-
